@@ -1,6 +1,7 @@
 package sse
 
 import (
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net/http"
@@ -28,13 +29,22 @@ func sseHandler(w http.ResponseWriter, r *http.Request) {
 
 	clientChan := make(chan []byte)
 	go func() {
-		for data := range audioStream { // This will block until new data is sent to audioStream
-			clientChan <- data
-		}
+	    	log.Println("SSE_GOROUTINE: Started. Ranging over audioStream.")
+    		for data := range audioStream {
+       			log.Printf("SSE_GOROUTINE: Got %d bytes from audioStream. Attempting to send to clientChan.", len(data))
+        		select {
+        			case clientChan <- data:
+            				log.Printf("SSE_GOROUTINE: Successfully sent %d bytes to clientChan.", len(data))
+        			case <-r.Context().Done(): // If the client request is cancelled
+            				log.Println("SSE_GOROUTINE: Client context done. Stopping.")
+           	 			return
+        		}
+    		}
+		log.Println("SSE_GOROUTINE: audioStream was closed or loop ended.")
 	}()
 
 	defer func() {
-		// Optional: clean up client-specific resources if any
+        	close(clientChan)
 		log.Println("Client disconnected")
 	}()
 
@@ -45,9 +55,11 @@ func sseHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		case audioData := <-clientChan:
 			if len(audioData) > 0 {
-				fmt.Fprintf(w, "data: %s\n\n", string(audioData)) // Assuming audio bytes can be represented as string for simplicity
+				fmt.Fprintf(w, "data: %s\n\n", base64.StdEncoding.EncodeToString(audioData))
 				flusher.Flush()
+				log.Println("SSE_HANDLER_LOOP: Successfully flushed data to client/Nginx.")
 			}
+    			flusher.Flush()
 		}
 	}
 }
