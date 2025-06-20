@@ -5,10 +5,14 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 )
 
-var audioStream = make(chan []byte)
+var ( 
+	clientStreams = make(map[chan []byte]bool)
+	clientsMutex = sync.Mutex{}
+)	
 
 func sseHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("Starting new SSE connection")
@@ -20,13 +24,28 @@ func sseHandler(w http.ResponseWriter, r *http.Request) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		log.Println("[ERROR] Streaming unsupported!")
 		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
 		return
 	}
-	flusher.Flush()
 
-	fmt.Fprintf(w, "retry: 1000\n\n") // Tell client to retry every second if connection is lost
-	flusher.Flush()
+	clientChan := make(chan []byte)
+	
+	clientsMutex.Lock()
+	clientStreams[clientChan] = true
+	clientsMutex.Unlock()
+	log.Printf("[INFO] New client connected. Total clients: %d", len(clientStreams))
+
+	defer func() {
+		clientsMutex.Lock()
+		delete(clientStreams, clientChan)
+		close(clientChan)
+		clientsMutex.Unlock()
+		log.Printf("[INFO] Client disconnected. Total clients: %d", len(clientStreams))
+	}()
+
+	keepAliveTicker := time.NewTicker(15 * time.Second)
+	defer keepAliveTicker.Stop()
 
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -34,20 +53,26 @@ func sseHandler(w http.ResponseWriter, r *http.Request) {
 	for {
     		select {
     			case <-r.Context().Done():
-        			log.Println("Client disconnected via context")
         			return
-			case <-ticker.C:
-        			fmt.Fprintf(w, ": keep-alive\n\n")
+			case <-keepAliveTicker.C:
+        			_, err := fmt.Fprintf(w, ": keep-alive\n\n")
+				if err != nil {
+					log.Printf("[ERROR] Keep-alive write error to client: %v", err)
+					return
+				}
         			flusher.Flush()
-    			case data, ok := <-audioStream:
+    			case data := <-clientChan:
         			if !ok {
-            				log.Println("audioStream closed")
+            				log.Println("[ERROR] Could not write to audio stream")
             				return
         			}
         			if len(data) > 0 {
-            				fmt.Fprintf(w, "data: %s\n\n", base64.StdEncoding.EncodeToString(data))
+            				_, err := fmt.Fprintf(w, "data: %s\n\n", base64.StdEncoding.EncodeToString(data))
+					if err != nil {
+						log.Printf("[ERROR] Cannot write to client: %v", err)
+						return
+					}
             				flusher.Flush()
-            				log.Println("SSE_HANDLER_LOOP: Successfully flushed data to client.")
         			}
     		}
 	}
@@ -55,9 +80,22 @@ func sseHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func SendBytes(bytes []byte) {
-	log.Printf("SSE_SEND: Attempting to send %d bytes to audioStream", len(bytes))
-	audioStream <- bytes
-	log.Println("SSE_SEND: Successfully sent to audioStream")
+	clientsMutex.Lock()
+	defer clientsMutex.Unlock()
+	
+	if len(clientStreams) == 0 {
+		log.Println("[WARM] SendBytes called, but there are no connected clients.")
+		return
+	}
+	
+	log.Printf("[INFO] Broadcasting %d bytes to %d clients", len(bytes), len(clientStreams))
+	for clientChan := range clientStreams {
+		select {
+		case clientChan <- bytes:
+		default:
+			log.Println("[WARN] Dropped message for a client, channel was full.")
+		}
+	}
 }
 
 func Start() {
